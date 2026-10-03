@@ -175,5 +175,5 @@ QAtSpiDBusConnection::QAtSpiDBusConnection(QObject *parent) : ... {
 - Qt 源码：`src/dbus/qdbusconnectionmanager.cpp`（`busConnection` / `connectToBus`）、
   `src/dbus/qdbusintegrator.cpp`（`enableDispatchDelayed` / `handleMessage`）
 
-完整原因分析（QtDBus 内部机制、实测矩阵、KDE 侧缓解措施与建议修法）见
-[`BUGREPORT.md`](BUGREPORT.md)。
+完整原因分析（QtDBus 内部机制、实测矩阵、KDE 侧缓解措施与建议修法）：
+[`BUGREPORT.md`](BUGREPORT.md)（中文，以此为准）· [`BUGREPORT.en.md`](BUGREPORT.en.md)（English）。
