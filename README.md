@@ -7,7 +7,7 @@
 - **Qt 6**：Plasma 面板的 Application Menu（全局菜单）**空白**，窗口内也**没有**菜单栏。
 - **Qt 5**：全局菜单正常显示 File / Edit / Help。
 
-程序本身**不打印任何东西**（除 `--help`），直接看窗口和面板即可。可分别用 Qt5 / Qt6 构建。
+程序本身**不打印任何东西**（除 `--help` 与 `--verbose`），直接看窗口和面板即可。可分别用 Qt5 / Qt6 构建。
 
 ## 现象
 
@@ -81,8 +81,8 @@ cmake -S . -B build -DAPPMENU_TEST_QT6=OFF      # 只编 Qt5
 | 探测应用里做了什么 | Qt 6.11.2 | Qt 5.15.19 |
 |---|---|---|
 | 只 `new QGuiApplication`（`--bare-probe`） | 0 / 0 正常 | 0 / 0 正常 |
-| **+ 创建 QWindow**（默认，等同 Krita prober） | **124 / 124 复现** | 0 / 0 正常 |
-| + 创建 QWindow，但不设 portal guard | 124 / 124 | **124 / 124（Qt5 也坏）** |
+| **+ 创建并在稍后销毁一个 `QWindow`**（默认，等同 Krita prober） | **124 / 124 复现** | 0 / 0 正常 |
+| + 同上，但不设 portal guard | 124 / 124 | **124 / 124（Qt5 也坏）** |
 
 （数值 = 从另一个进程对导出对象做 `Introspect` / `AboutToShow` 的返回码；`124` 表示超时无应答。）
 
@@ -155,8 +155,11 @@ QAtSpiDBusConnection::QAtSpiDBusConnection(QObject *parent) : ... {
 4. Qt5 里同样的“恢复投递”用的是 `QTimer::singleShot(0, enabler, ...)`，但**只要连接是在
    探测应用存活期间建立的，Qt5 同样会永久挂起**（上表最后一行）。Qt5 之所以在 Krita 上
    没事，是因为 Krita 的 prober 设了 `QT_NO_XDG_DESKTOP_PORTAL=1`，把当时唯一的触发者
-   （XDG portal）挡住了；而 Qt6 下探测应用**创建 QWindow** 时仍会经无障碍（at-spi）等
-   平台路径打开 session bus，挡不住。
+   （XDG portal）挡住了；而 Qt6 下探测应用**销毁那个 `QWindow`** 时仍会打开 session bus：
+   `QWindow::~QWindow()` 调用 `QAccessible::isActive()`，后者经 QPA 插件懒加载 at-spi 桥
+   （`src/gui/accessible/linux/dbusconnection.cpp`）→ `QDBusConnection::sessionBus()`。
+   探测窗口只 `create()`、从不 `show()`，所以这是该应用整个生命里唯一一次无障碍查询；
+   现有的两个 guard 都挡不住它，只有 `AT_SPI_BUS_ADDRESS`（见上节）能拦住。
 
 对应 Krita 代码：`libs/ui/opengl/KisOpenGLModeProber.cpp` 的 `probeFormat()`
 （`new QGuiApplication` + `QWindow surface; surface.create();`），调用链来自
@@ -171,3 +174,6 @@ QAtSpiDBusConnection::QAtSpiDBusConnection(QObject *parent) : ... {
   session bus 连接的建立
 - Qt 源码：`src/dbus/qdbusconnectionmanager.cpp`（`busConnection` / `connectToBus`）、
   `src/dbus/qdbusintegrator.cpp`（`enableDispatchDelayed` / `handleMessage`）
+
+完整原因分析（QtDBus 内部机制、实测矩阵、KDE 侧缓解措施与建议修法）见
+[`BUGREPORT.md`](BUGREPORT.md)。

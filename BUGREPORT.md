@@ -265,7 +265,6 @@ Plasma 也记住了 `(:service, /MenuBar/N)`；但 applet 对该对象的 `GetLa
     * 二是 `QAccessible::isActive()` 会因 QPA 集成把 `accessibility()` 实现为懒加载而实例化
       at-spi 桥、建立 D-Bus 连接，这与该函数被建议的使用方式（廉价守卫）不符。
 * 我并未确认 Qt 那边是否已有相关问题报告。如果有熟悉 Qt 的开发者能够确认这确实是 Qt 的 bug，希望您能帮忙向 Qt 报告。
-  Qt 侧更详细的技术描述见随附的 `QTBUG-REPORT.md`。
 
 ## 四、相关报告
 
@@ -573,8 +572,7 @@ and Qt draws the menu bar back inside the window.
       QPA integration implements `accessibility()` lazily; this does not match how the function is recommended to be
       used (as a cheap guard).
 * I have not confirmed whether there is already a related Qt report. If a developer familiar with Qt can confirm that
-  this is indeed a Qt bug, I hope you can help report it to Qt. A more detailed technical description for the Qt side is
-  in the accompanying `QTBUG-REPORT.md`.
+  this is indeed a Qt bug, I hope you can help report it to Qt.
 
 ## IV. Related Reports
 

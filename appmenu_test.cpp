@@ -11,7 +11,7 @@
 //   * the Plasma "Application Menu" widget in the panel
 //   * whether the window itself shows a menu bar
 //
-// Build: see build.sh (produces appmenu_test-qt6 and appmenu_test-qt5)
+// Build: see CMakeLists.txt (targets appmenu_test-qt6 / appmenu_test-qt5)
 
 #include <QApplication>
 #include <QCoreApplication>
@@ -79,7 +79,7 @@ namespace {
     // QGuiApplication that is destroyed again before the real application exists.
     void throwAwayGuiApplication(const bool workaround, const bool portalGuard) {
         QByteArray name("appmenu_test");
-        char *argv = name.data();
+        char *argv[] = { name.data(), nullptr };   // proper null-terminated argv
 
         const bool applyWorkaround = workaround
                                      && qEnvironmentVariableIsSet("KDE_FULL_SESSION")
@@ -115,7 +115,7 @@ namespace {
 
         {
             int argc = 1;
-            QGuiApplication probe(argc, &argv);
+            QGuiApplication probe(argc, argv);
 
             if (g_probeCreatesWindow) {
                 const QSurfaceFormat format;
@@ -159,10 +159,11 @@ namespace {
             "                 (does NOT work: Qt caches the failed session-bus connection)\n"
             "  --reset-bus    disconnectFromBus(qt_default_session_bus) after the probes\n"
             "                 (does NOT work: that pointer is pinned in defaultBuses[])\n"
-            "  --verbose      phase markers on stderr (for QDBUS_DEBUG style investigation)\n"
+            "  --verbose      phase markers on stderr, plus winId, isNativeMenuBar and the\n"
+            "                 /MenuBar/1 registration state (headless diagnostics)\n"
             "  --wayland      force QT_QPA_PLATFORM=wayland (default: xcb, like krita)\n"
             "  --hidden       do not show the window (for headless diagnostics)\n"
-            "  --help\n"
+            "  --help         print this text and exit\n"
             "\n"
             "Watch the Plasma \"Application Menu\" widget and the window's own menu bar.\n"
             "plain/core: the panel shows File/Edit (no in-window menu bar is normal).\n"
@@ -185,8 +186,19 @@ int main(int argc, char **argv) {
             arg_str == QLatin1String("--help") || arg_str == QLatin1String("-h")) {
             printUsage();
             return 0;
-        } else if (arg_str == QLatin1String("--probes") && i + 1 < argc) {
-            probes = QString::fromLocal8Bit(argv[++i]).toInt();
+        } else if (arg_str == QLatin1String("--probes")) {
+            if (i + 1 >= argc) {
+                std::printf("--probes requires a value\n\n");
+                printUsage();
+                return 2;
+            }
+            bool ok = false;
+            probes = QString::fromLocal8Bit(argv[++i]).toInt(&ok);
+            if (!ok || probes < 1) {
+                std::printf("invalid --probes value (expected a positive integer)\n\n");
+                printUsage();
+                return 2;
+            }
         } else if (arg_str == QLatin1String("--no-workaround")) {
             workaround = false;
         } else if (arg_str == QLatin1String("--bare-probe")) {
@@ -243,9 +255,9 @@ int main(int argc, char **argv) {
     if (mode == QLatin1String("core") || mode == QLatin1String("krita")) {
         int argc2 = 1;
         QByteArray name("appmenu_test");
-        char *argv2 = name.data();
+        char *argv2[] = { name.data(), nullptr };
         verbose("[verbose] throw-away QCoreApplication\n");
-        QCoreApplication throwAway(argc2, &argv2);
+        QCoreApplication throwAway(argc2, argv2);
     }
 
     if (mode == QLatin1String("probe") || mode == QLatin1String("krita")) {
@@ -313,7 +325,7 @@ int main(int argc, char **argv) {
     auto *label = new QLabel(labelText);
     label->setAlignment(Qt::AlignCenter);
     label->setWordWrap(true);
-    label->setMargin(12);
+    label->setContentsMargins(12, 12, 12, 12);
     window.setCentralWidget(label);
     window.resize(620, 220);
     if (!hidden) {
