@@ -270,10 +270,15 @@ Plasma 也记住了 `(:service, /MenuBar/N)`；但 applet 对该对象的 `GetLa
 
 ## 四、相关报告
 
-* KDE bug 483170 — appmenu (global menu) doesn't work with krita on plasma 6
-* KDE bug 515889 — [qt6] Application Menu is unavailable on Krita 6
-* KDE bug 518583 — Global menu broken on KDE Plasma after commit 2c920c28 (Remove QT_QPA_PLATFORMTHEME)
-* Krita 提交 `8d6a2a5d12` — "Do not load the platform theme when created a test QApplication"（BUG 408015）
+* [KDE bug 483170](https://bugs.kde.org/show_bug.cgi?id=483170) — appmenu (global menu) doesn't work with krita on
+  plasma 6
+* [KDE bug 515889](https://bugs.kde.org/show_bug.cgi?id=515889) — [qt6] Application Menu is unavailable on Krita 6
+* [KDE bug 518583](https://bugs.kde.org/show_bug.cgi?id=518583) — Global menu broken on KDE Plasma after commit 2c920c28
+  (Remove QT_QPA_PLATFORMTHEME)
+* Krita 提交 [`8d6a2a5d`](https://invent.kde.org/graphics/krita/-/commit/8d6a2a5d123c90bfb2a4cabdff78a8fc54584e20) — "Do
+  not load the platform theme when created a test
+  QApplication"（[BUG 408015](https://bugs.kde.org/show_bug.cgi?id=408015)）
+* 最小复现仓库（可直接构建运行）：<https://github.com/worksoup/appmenu_test>
 
 ---
 

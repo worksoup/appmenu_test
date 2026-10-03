@@ -1,5 +1,7 @@
 # appmenu_test — minimal visual reproducer for the empty Plasma global menu on Krita 6 / Qt 6
 
+> 中文原文：[`README.md`](README.md)
+>
 > **Translator’s note:** the Chinese original — [`README.md`](README.md) — is authoritative; this file is a
 > translation of it.
 
@@ -14,11 +16,11 @@ It can be built against Qt 5 and Qt 6.
 
 ## Symptoms
 
-| | Panel global menu | In-window menu bar |
-|---|---|---|
-| `plain` (control) | File / Edit / Help | none (normal: the menu was given to the global menu) |
-| `probe` / `krita` (Qt 6) | **empty** | **none** ← BUG |
-| `probe` / `krita` (Qt 5) | File / Edit / Help | none |
+|                          | Panel global menu  | In-window menu bar                                   |
+|--------------------------|--------------------|------------------------------------------------------|
+| `plain` (control)        | File / Edit / Help | none (normal: the menu was given to the global menu) |
+| `probe` / `krita` (Qt 6) | **empty**          | **none** ← BUG                                       |
+| `probe` / `krita` (Qt 5) | File / Edit / Help | none                                                 |
 
 `KDE_NO_GLOBAL_MENU=1` moves the menu bar back into the window (the same in every mode); this is the known temporary
 workaround for Krita.
@@ -59,20 +61,20 @@ cmake -S . -B build -DAPPMENU_TEST_QT6=OFF      # Qt 5 only
 
 ### Options
 
-| Option | Effect |
-|---|---|
-| `--probes N` | number of throw-away `QGuiApplication`s (`probe`: 1, `krita`: 3) |
-| `--bare-probe` | the probe application only does `new QGuiApplication`, without a QWindow (**this does not reproduce**) |
-| `--block-a11y` | sets `AT_SPI_BUS_ADDRESS` non-empty in the probe application, so the a11y bridge never touches the session bus — **the effective workaround** |
-| `--reset-a11y` | `disconnectFromBus("a11y")` after the probes, dropping the dead a11y connection the probe left behind |
-| `--no-portal-guard` | do not set `QT_NO_XDG_DESKTOP_PORTAL=1` in the probe application (**Qt 5 breaks too**; it must still be kept when using `--block-a11y`) |
-| `--no-workaround` | do not call `QGuiApplication::setDesktopSettingsAware(false)` (no effect on Qt 6) |
-| `--block-dbus` | point `DBUS_SESSION_BUS_ADDRESS` at a dead address during the probe (**measured useless and harmful**, see below) |
-| `--reset-bus` | `disconnectFromBus("qt_default_session_bus")` after the probes (**measured useless**, see below) |
-| `--verbose` | print phase markers, `winId`, `isNativeMenuBar` and the `/MenuBar/1` registration state to stderr (for scripted diagnostics) |
-| `--wayland` | force `QT_QPA_PLATFORM=wayland` (default: Krita’s xcb / XWayland) |
-| `--hidden` | do not show the window (for scripted diagnostics) |
-| `--help` | usage |
+| Option              | Effect                                                                                                                                        |
+|---------------------|-----------------------------------------------------------------------------------------------------------------------------------------------|
+| `--probes N`        | number of throw-away `QGuiApplication`s (`probe`: 1, `krita`: 3)                                                                              |
+| `--bare-probe`      | the probe application only does `new QGuiApplication`, without a QWindow (**this does not reproduce**)                                        |
+| `--block-a11y`      | sets `AT_SPI_BUS_ADDRESS` non-empty in the probe application, so the a11y bridge never touches the session bus — **the effective workaround** |
+| `--reset-a11y`      | `disconnectFromBus("a11y")` after the probes, dropping the dead a11y connection the probe left behind                                         |
+| `--no-portal-guard` | do not set `QT_NO_XDG_DESKTOP_PORTAL=1` in the probe application (**Qt 5 breaks too**; it must still be kept when using `--block-a11y`)       |
+| `--no-workaround`   | do not call `QGuiApplication::setDesktopSettingsAware(false)` (no effect on Qt 6)                                                             |
+| `--block-dbus`      | point `DBUS_SESSION_BUS_ADDRESS` at a dead address during the probe (**measured useless and harmful**, see below)                             |
+| `--reset-bus`       | `disconnectFromBus("qt_default_session_bus")` after the probes (**measured useless**, see below)                                              |
+| `--verbose`         | print phase markers, `winId`, `isNativeMenuBar` and the `/MenuBar/1` registration state to stderr (for scripted diagnostics)                  |
+| `--wayland`         | force `QT_QPA_PLATFORM=wayland` (default: Krita’s xcb / XWayland)                                                                             |
+| `--hidden`          | do not show the window (for scripted diagnostics)                                                                                             |
+| `--help`            | usage                                                                                                                                         |
 
 To see the fixed state (the panel global menu then shows File/Edit/Help):
 
@@ -82,11 +84,11 @@ To see the fixed state (the panel global menu then shows File/Edit/Help):
 
 ## Necessary conditions for reproducing (measured)
 
-| What the probe application does | Qt 6.11.2 | Qt 5.15.19 |
-|---|---|---|
-| only `new QGuiApplication` (`--bare-probe`) | 0 / 0 fine | 0 / 0 fine |
-| **+ create a `QWindow` and destroy it later** (default, same as Krita’s prober) | **124 / 124 reproduces** | 0 / 0 fine |
-| + as above, but without the portal guard | 124 / 124 | **124 / 124 (Qt 5 breaks too)** |
+| What the probe application does                                                 | Qt 6.11.2                | Qt 5.15.19                      |
+|---------------------------------------------------------------------------------|--------------------------|---------------------------------|
+| only `new QGuiApplication` (`--bare-probe`)                                     | 0 / 0 fine               | 0 / 0 fine                      |
+| **+ create a `QWindow` and destroy it later** (default, same as Krita’s prober) | **124 / 124 reproduces** | 0 / 0 fine                      |
+| + as above, but without the portal guard                                        | 124 / 124                | **124 / 124 (Qt 5 breaks too)** |
 
 (The values are the exit status of `Introspect` / `AboutToShow` issued from another process against the exported
 object; `124` means it timed out without an answer.)
@@ -113,16 +115,16 @@ The probe application therefore no longer creates a session-bus connection, and 
 created by the **real application** → `enableDispatchDelayed(qApp)` lands on the real `qApp` → delivery resumes when
 `exec()` runs → the global menu works.
 
-| Configuration (`probe` mode, measured on Qt 6.11.2) | `isNativeMenuBar` | `/MenuBar/1` registered | cross-process `Introspect`/`AboutToShow` | Verdict |
-|---|---|---|---|---|
-| baseline | 1 | 1 | **124 / 124** | reproduces the bug |
-| `--block-a11y` | 1 | 1 | **0 / 0** | ✅ fixed |
-| `--block-a11y --reset-a11y` | 1 | 1 | **0 / 0** | ✅ fixed (and no dead a11y connection left) |
-| `--block-a11y --no-portal-guard` | 1 | 1 | 124 / 124 | the portal guard is still required |
-| `--no-portal-guard` | 1 | 1 | 124 / 124 | the portal creates a connection |
-| `--bare-probe` | 1 | 1 | 0 / 0 | no window in the probe → never reproduced in the first place |
-| `--block-dbus` | **0** | **0** | no object to probe | ❌ the whole session bus dies (not even a global menu is left) |
-| `--reset-bus` | 1 | 1 | 124 / 124 | ❌ no effect |
+| Configuration (`probe` mode, measured on Qt 6.11.2) | `isNativeMenuBar` | `/MenuBar/1` registered | cross-process `Introspect`/`AboutToShow` | Verdict                                                        |
+|-----------------------------------------------------|-------------------|-------------------------|------------------------------------------|----------------------------------------------------------------|
+| baseline                                            | 1                 | 1                       | **124 / 124**                            | reproduces the bug                                             |
+| `--block-a11y`                                      | 1                 | 1                       | **0 / 0**                                | ✅ fixed                                                       |
+| `--block-a11y --reset-a11y`                         | 1                 | 1                       | **0 / 0**                                | ✅ fixed (and no dead a11y connection left)                    |
+| `--block-a11y --no-portal-guard`                    | 1                 | 1                       | 124 / 124                                | the portal guard is still required                             |
+| `--no-portal-guard`                                 | 1                 | 1                       | 124 / 124                                | the portal creates a connection                                |
+| `--bare-probe`                                      | 1                 | 1                       | 0 / 0                                    | no window in the probe → never reproduced in the first place   |
+| `--block-dbus`                                      | **0**             | **0**                   | no object to probe                       | ❌ the whole session bus dies (not even a global menu is left) |
+| `--reset-bus`                                       | 1                 | 1                       | 124 / 124                                | ❌ no effect                                                   |
 
 Both failing approaches are explained by the Qt sources:
 
@@ -176,19 +178,9 @@ The corresponding Krita code: `libs/ui/opengl/KisOpenGLModeProber.cpp`, `probeFo
 (`new QGuiApplication` plus `QWindow surface; surface.create();`), reached from
 `krita/main.cc` → `KisOpenGL::selectSurfaceConfig()`.
 
-## Related records
-
-- KDE Bug 483170 “appmenu (global menu) doesn’t work with krita on plasma 6”
-- KDE Bug 515889 “[qt6] Application Menu is unavailable on Krita 6”
-- Krita’s historical fix `8d6a2a5d12` (“Do not load the platform theme when created a test QApplication”,
-  BUG 408015): its `setDesktopSettingsAware(false)` is no longer enough on Qt 6 to prevent the session-bus
-  connection from being created
-- Qt sources: `src/dbus/qdbusconnectionmanager.cpp` (`busConnection` / `connectToBus`),
-  `src/dbus/qdbusintegrator.cpp` (`enableDispatchDelayed` / `handleMessage`)
-
 Full root-cause analysis (QtDBus internals, measured matrices, KDE-side mitigation and suggested fixes):
-[`BUGREPORT.en.md`](BUGREPORT.en.md) (English) · [`BUGREPORT.md`](BUGREPORT.md) (Chinese, authoritative).
+[`BUGREPORT.en.md`](BUGREPORT.en.md) (English).
 
 ---
 
-> Chinese original (authoritative): [`README.md`](README.md)
+> 中文原文：[`README.md`](README.md)
