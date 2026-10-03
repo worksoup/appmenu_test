@@ -1,9 +1,15 @@
-# build output
-appmenu_test-qt5
-appmenu_test-qt6
+# CMake build tree
+/build/
+
+# binaries built in-tree
+/appmenu_test-qt5
+/appmenu_test-qt6
 
 # editor / OS cruft
+.qtcreator/
 *.o
 *.user
 *~
 .DS_Store
+
+.idea/

@@ -22,27 +22,36 @@
 ## 构建
 
 ```sh
-./build.sh          # 需要 qt6-base / qt5-base 的开发文件（pkg-config）
+cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cmake --build build -j
+ctest --test-dir build --output-on-failure      # 冒烟测试：两个变体的 --help
 ```
 
-产出：
+在同一棵构建树里按可用性分别产出 Qt6 / Qt5 两份：
 
-- `appmenu_test-qt6`
-- `appmenu_test-qt5`
+- `build/appmenu_test-qt6`
+- `build/appmenu_test-qt5`
+
+只想要其中一份：
+
+```sh
+cmake -S . -B build -DAPPMENU_TEST_QT5=OFF      # 只编 Qt6
+cmake -S . -B build -DAPPMENU_TEST_QT6=OFF      # 只编 Qt5
+```
 
 ## 运行
 
 ```sh
-./appmenu_test-qt6 plain      # 对照：面板全局菜单应显示 File/Edit/Help
-./appmenu_test-qt6 probe      # 复现 BUG
-./appmenu_test-qt6 krita      # 最贴近 Krita：临时 QCoreApplication + 3 个探测应用
-./appmenu_test-qt6 core       # 只加临时 QCoreApplication（无害）
-./appmenu_test-qt5 probe      # Qt5 同路径：正常
+./build/appmenu_test-qt6 plain      # 对照：面板全局菜单应显示 File/Edit/Help
+./build/appmenu_test-qt6 probe      # 复现 BUG
+./build/appmenu_test-qt6 krita      # 最贴近 Krita：临时 QCoreApplication + 3 个探测应用
+./build/appmenu_test-qt6 core       # 只加临时 QCoreApplication（无害）
+./build/appmenu_test-qt5 probe      # Qt5 同路径：正常
 ```
 
 > 如果 shell 里存在 `SESSION_MANAGER` 而 `~/.config` 不可写，Qt 会弹出
 > 「Configuration file ... not writable」模态框卡住程序。用
-> `env -u SESSION_MANAGER XDG_CONFIG_HOME=/tmp/appmenu-cfg ./appmenu_test-qt6 probe` 规避。
+> `env -u SESSION_MANAGER XDG_CONFIG_HOME=/tmp/appmenu-cfg ./build/appmenu_test-qt6 probe` 规避。
 
 ### 选项
 
