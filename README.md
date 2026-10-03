@@ -59,11 +59,22 @@ cmake -S . -B build -DAPPMENU_TEST_QT6=OFF      # 只编 Qt5
 |---|---|
 | `--probes N` | 探测用 `QGuiApplication` 的个数（`probe` 默认 1，`krita` 默认 3） |
 | `--bare-probe` | 探测应用只 `new QGuiApplication`，不创建 QWindow（**这样不会复现**） |
-| `--no-portal-guard` | 不在探测应用里设 `QT_NO_XDG_DESKTOP_PORTAL=1`（**Qt5 也会坏**） |
+| `--block-a11y` | 探测应用里把 `AT_SPI_BUS_ADDRESS` 设为非空，a11y 桥因此不再碰 session bus —— **有效的 workaround** |
+| `--reset-a11y` | 探测结束后 `disconnectFromBus("a11y")`，清掉探测应用留下的死 a11y 连接 |
+| `--no-portal-guard` | 不在探测应用里设 `QT_NO_XDG_DESKTOP_PORTAL=1`（**Qt5 也会坏**；与 `--block-a11y` 一起用时也必须保留） |
 | `--no-workaround` | 不调用 `QGuiApplication::setDesktopSettingsAware(false)`（Qt6 下无影响） |
+| `--block-dbus` | 探测期把 `DBUS_SESSION_BUS_ADDRESS` 指向死地址（**实测无效且有害**，见下节） |
+| `--reset-bus` | 探测后 `disconnectFromBus("qt_default_session_bus")`（**实测无效**，见下节） |
+| `--verbose` | 往 stderr 打印阶段标记、`winId`、`isNativeMenuBar` 与 `/MenuBar/1` 注册状态（脚本化诊断用） |
 | `--wayland` | 强制 `QT_QPA_PLATFORM=wayland`（默认沿用 Krita 的 xcb / XWayland） |
 | `--hidden` | 不显示窗口（供脚本化诊断用） |
 | `--help` | 用法 |
+
+想看修好的样子（面板全局菜单会出现 File/Edit/Help）：
+
+```sh
+./build/appmenu_test-qt6 probe --block-a11y --reset-a11y
+```
 
 ## 复现的必要条件（实测）
 
@@ -74,6 +85,59 @@ cmake -S . -B build -DAPPMENU_TEST_QT6=OFF      # 只编 Qt5
 | + 创建 QWindow，但不设 portal guard | 124 / 124 | **124 / 124（Qt5 也坏）** |
 
 （数值 = 从另一个进程对导出对象做 `Introspect` / `AboutToShow` 的返回码；`124` 表示超时无应答。）
+
+## 能不能"在探测阶段加个开关"就修掉它？（实测）
+
+可以，而且**不需要屏蔽整条 session bus**：只在探测应用存活期间把无障碍（at-spi）桥从 session bus
+上引开即可。原理在 Qt6 的 `src/gui/accessible/linux/dbusconnection.cpp`：
+
+```cpp
+QAtSpiDBusConnection::QAtSpiDBusConnection(QObject *parent) : ... {
+    QByteArray addressEnv = qgetenv("AT_SPI_BUS_ADDRESS");
+    if (!addressEnv.isEmpty()) {            // 非空就完全绕过 session bus
+        m_enabled = true;
+        connectA11yBus(QString::fromLocal8Bit(addressEnv));
+        return;
+    }
+    QDBusConnection c = QDBusConnection::sessionBus();   // ← 探测期建立连接的元凶
+    ...
+```
+
+于是探测应用不再建立 session bus 连接，进程里第一条连接由**真实应用**建立 →
+`enableDispatchDelayed(qApp)` 落在真实 `qApp` 上 → `exec()` 时投递恢复 → 全局菜单正常。
+
+| 配置（`probe` 模式，Qt 6.11.2 实测） | `isNativeMenuBar` | `/MenuBar/1` 注册 | 跨进程 `Introspect`/`AboutToShow` | 结论 |
+|---|---|---|---|---|
+| 基线 | 1 | 1 | **124 / 124** | 复现 bug |
+| `--block-a11y` | 1 | 1 | **0 / 0** | ✅ 修好 |
+| `--block-a11y --reset-a11y` | 1 | 1 | **0 / 0** | ✅ 修好（且不留死 a11y 连接） |
+| `--block-a11y --no-portal-guard` | 1 | 1 | 124 / 124 | portal guard 仍然必需 |
+| `--no-portal-guard` | 1 | 1 | 124 / 124 | portal 会建立连接 |
+| `--bare-probe` | 1 | 1 | 0 / 0 | 探测里不建窗口 → 本来就不复现 |
+| `--block-dbus` | **0** | **0** | 无对象可探 | ❌ 整条 session bus 变死（连全局菜单都没了） |
+| `--reset-bus` | 1 | 1 | 124 / 124 | ❌ 无效 |
+
+两个失败方案的原因都在 Qt 源码里：
+
+* `--block-dbus`：`QDBusConnectionManager::doConnectToStandardBus()` 里 `setConnection(name, d)`
+  是在 `d->setConnection(c /* == nullptr */, error)` **之前**无条件执行的，所以"连不上"也会被缓存；
+  `busConnection()` 之后永远返回这条死连接 ⇒ 整个进程失去 session bus（不只是全局菜单，
+  KConfig/KIO/通知等一起失效）。
+* `--reset-bus`：`QDBusConnection::disconnectFromBus("qt_default_session_bus")` →
+  `QDBusConnectionManager::removeConnection()` 只从 `connectionHash` 删除，**不动 `defaultBuses[]`**
+  （全项目只有 manager 构造函数把它置 nullptr），而 `busConnection()` 只要 `defaultBuses[type]` 非空就直接返回 ⇒
+  真实应用拿到的还是那条 `delivery suspended` 的连接。对比之下 `--reset-a11y` 有效，是因为 `a11y`
+  只是 `connectionHash` 里的命名连接，不在 `defaultBuses[]` 里，可以真正被删掉。
+
+要点：
+
+* `AT_SPI_BUS_ADDRESS` 必须**只在探测应用存活期间**设置。全程设置虽然也能"修好"，但会把整个进程的
+  无障碍引到假地址（实测 `AT_SPI_BUS_ADDRESS=unix:path=...` 进程级设置同样是 0/0/0）。本程序用 RAII
+  `EnvironmentSetter` 自动恢复。
+* 没有 `Qt::AA_*` 属性或公开 API 能"关掉无障碍"：实测进程级 `QT_ACCESSIBILITY=0`、`NO_AT_BRIDGE=1`
+  都无效（桥照样建立 session bus）；`QT_LINUX_ACCESSIBILITY_ALWAYS_ON` 是"强制开"。
+* 这仍是 workaround：依赖 at-spi 桥"`AT_SPI_BUS_ADDRESS` 非空即 early-return"这一实现细节。
+  根因修法还是不要在真实应用之前创建 `QGuiApplication`（子进程探测 / 应用内探测）。
 
 ## 根因摘要
 

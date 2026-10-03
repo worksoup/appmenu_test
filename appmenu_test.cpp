@@ -35,6 +35,12 @@ namespace {
     bool g_blockDbus = false;
     // --reset-bus: drop the cached session-bus connection after the probes
     bool g_resetBus = false;
+    // --block-a11y: keep the at-spi bridge off the session bus inside the probe app.
+    // Setting AT_SPI_BUS_ADDRESS non-empty makes Qt's accessibility bridge use that
+    // address and never call QDBusConnection::sessionBus() at all.
+    bool g_blockA11y = false;
+    // --reset-a11y: drop the cached "a11y" connection after the probes
+    bool g_resetA11y = false;
     // --verbose: phase markers on stderr (for QDBUS_DEBUG style investigation)
     bool g_verbose = false;
 
@@ -86,6 +92,24 @@ namespace {
         if (portalGuard)
             portal.reset(new EnvironmentSetter("QT_NO_XDG_DESKTOP_PORTAL", "1"));
 
+        // The at-spi bridge (src/gui/accessible/linux/dbusconnection.cpp) returns
+        // early when AT_SPI_BUS_ADDRESS is set, so the probe app never calls
+        // QDBusConnection::sessionBus() and cannot leave a suspended connection
+        // behind. Restored when this scope ends.
+        QScopedPointer<EnvironmentSetter> a11yGuard;
+        if (g_blockA11y)
+            a11yGuard.reset(new EnvironmentSetter("AT_SPI_BUS_ADDRESS",
+                                                  "unix:path=/nonexistent-appmenu-a11y"));
+
+        // --block-dbus: the blunt version. Note that Qt caches the *failed*
+        // session-bus connection (QDBusConnectionManager::doConnectToStandardBus()
+        // calls setConnection() unconditionally), so this kills the session bus for
+        // the whole process instead of fixing anything.
+        QScopedPointer<EnvironmentSetter> dbusGuard;
+        if (g_blockDbus)
+            dbusGuard.reset(new EnvironmentSetter("DBUS_SESSION_BUS_ADDRESS",
+                                                  "unix:path=/nonexistent-appmenu-probe"));
+
         if (applyWorkaround)
             QGuiApplication::setDesktopSettingsAware(false);
 
@@ -127,8 +151,14 @@ namespace {
             "  --no-portal-guard  do not set QT_NO_XDG_DESKTOP_PORTAL=1 in the probe app\n"
             "  --bare-probe   probe app only constructs QGuiApplication (no QWindow/GL;\n"
             "                 this alone does NOT reproduce the bug)\n"
-            "  --block-dbus   point DBUS_SESSION_BUS_ADDRESS at a dead address inside the probe\n"
-            "  --reset-bus    disconnectFromBus() after the probes, so the real app rebuilds it\n"
+            "  --block-a11y   keep the at-spi bridge off the session bus in the probe app\n"
+            "                 (WORKAROUND: with this the bug does not happen at all)\n"
+            "  --reset-a11y   disconnectFromBus(\"a11y\") after the probes, so the real app\n"
+            "                 is not left with the probe app's dead a11y connection\n"
+            "  --block-dbus   point DBUS_SESSION_BUS_ADDRESS at a dead address in the probe\n"
+            "                 (does NOT work: Qt caches the failed session-bus connection)\n"
+            "  --reset-bus    disconnectFromBus(qt_default_session_bus) after the probes\n"
+            "                 (does NOT work: that pointer is pinned in defaultBuses[])\n"
             "  --verbose      phase markers on stderr (for QDBUS_DEBUG style investigation)\n"
             "  --wayland      force QT_QPA_PLATFORM=wayland (default: xcb, like krita)\n"
             "  --hidden       do not show the window (for headless diagnostics)\n"
@@ -167,6 +197,10 @@ int main(int argc, char **argv) {
             hidden = true;
         } else if (arg_str == QLatin1String("--no-portal-guard")) {
             portalGuard = false;
+        } else if (arg_str == QLatin1String("--block-a11y")) {
+            g_blockA11y = true;
+        } else if (arg_str == QLatin1String("--reset-a11y")) {
+            g_resetA11y = true;
         } else if (arg_str == QLatin1String("--block-dbus")) {
             g_blockDbus = true;
         } else if (arg_str == QLatin1String("--reset-bus")) {
@@ -199,6 +233,11 @@ int main(int argc, char **argv) {
     else if (!qEnvironmentVariableIsSet("QT_QPA_PLATFORM"))
         qputenv("QT_QPA_PLATFORM", "xcb");
 
+    verbose("[verbose] flags: workaround=%d portalGuard=%d blockA11y=%d resetA11y=%d "
+            "blockDbus=%d resetBus=%d probeCreatesWindow=%d mode=%s\n",
+            workaround, portalGuard, g_blockA11y, g_resetA11y, g_blockDbus, g_resetBus,
+            g_probeCreatesWindow, qPrintable(mode));
+
     QCoreApplication::setAttribute(Qt::AA_ShareOpenGLContexts, true);
 
     if (mode == QLatin1String("core") || mode == QLatin1String("krita")) {
@@ -215,6 +254,15 @@ int main(int argc, char **argv) {
             throwAwayGuiApplication(workaround, portalGuard);
             verbose("[verbose] probe %d/%d end\n", i + 1, probes);
         }
+    }
+
+    if (g_resetA11y) {
+        // The probe app's bridge connected to the dummy address, leaving a dead
+        // "a11y" connection in the global cache. Unlike the session bus, that name
+        // is not pinned in QDBusConnectionManager::defaultBuses[], so it is really
+        // dropped and the real app can connect to the accessibility bus normally.
+        verbose("[verbose] disconnectFromBus(a11y)\n");
+        QDBusConnection::disconnectFromBus(QStringLiteral("a11y"));
     }
 
     if (g_resetBus) {
@@ -240,17 +288,29 @@ int main(int argc, char **argv) {
     menuBar->addMenu(QStringLiteral("Help"))->addAction(QStringLiteral("About"));
 
     const bool buggyMode = mode == QLatin1String("probe") || mode == QLatin1String("krita");
-    auto *label = new QLabel(buggyMode
-                                 ? QStringLiteral("<b>mode: %1</b> (throw-away QGuiApplication first)<br><br>"
-                                     "Expected BUG: the Plasma Application Menu widget stays <b>empty</b>,"
-                                     " and this window shows <b>no menu bar</b>.<br>"
-                                     "Compare with <tt>appmenu_test plain</tt>: the panel then shows File/Edit.")
-                                 .arg(mode)
-                                 : QStringLiteral("<b>mode: %1</b> (control)<br><br>"
-                                     "The Plasma Application Menu widget should show <b>File / Edit / Help</b>"
-                                     " while this window is focused.<br>"
-                                     "No menu bar inside the window is normal: Qt gives it to the global menu.")
-                                 .arg(mode));
+
+    QString labelText;
+    if (buggyMode && g_blockA11y) {
+        labelText = QStringLiteral("<b>mode: %1 + --block-a11y</b><br><br>"
+                    "WORKAROUND ACTIVE: the probe app was kept off the session bus,"
+                    " so the bug should <b>not</b> happen.<br>"
+                    "The Plasma Application Menu widget should show <b>File / Edit / Help</b>.")
+                .arg(mode);
+    } else if (buggyMode) {
+        labelText = QStringLiteral("<b>mode: %1</b> (throw-away QGuiApplication first)<br><br>"
+                    "Expected BUG: the Plasma Application Menu widget stays <b>empty</b>,"
+                    " and this window shows <b>no menu bar</b>.<br>"
+                    "Compare with <tt>appmenu_test plain</tt>: the panel then shows File/Edit.<br>"
+                    "Add <tt>--block-a11y</tt> to see the workaround working.")
+                .arg(mode);
+    } else {
+        labelText = QStringLiteral("<b>mode: %1</b> (control)<br><br>"
+                    "The Plasma Application Menu widget should show <b>File / Edit / Help</b>"
+                    " while this window is focused.<br>"
+                    "No menu bar inside the window is normal: Qt gives it to the global menu.")
+                .arg(mode);
+    }
+    auto *label = new QLabel(labelText);
     label->setAlignment(Qt::AlignCenter);
     label->setWordWrap(true);
     label->setMargin(12);
@@ -261,6 +321,10 @@ int main(int argc, char **argv) {
     } else {
         auto _ = window.winId(); // force the native window, keep it unmapped
     }
+    verbose("[verbose] winId=0x%lx\n", static_cast<unsigned long>(window.winId()));
+    verbose("[verbose] isNativeMenuBar=%d /MenuBar/1 registered=%d\n",
+            menuBar->isNativeMenuBar(),
+            QDBusConnection::sessionBus().objectRegisteredAt(QStringLiteral("/MenuBar/1")) != nullptr);
 
     return QApplication::exec();
 }
