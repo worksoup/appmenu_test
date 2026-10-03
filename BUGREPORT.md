@@ -1,57 +1,69 @@
-# Bug 报告：Krita 6（Qt 6）下 Plasma 全局菜单空白 —— session bus 连接属于一个在 OpenGL 探测阶段创建、随即销毁的临时 QApplication
+# 原因分析：Krita 6（Qt 6）下 Plasma 全局菜单空白
 
-**产品 / 组件：** krita / general（Qt 6 构建）
-**版本：** 6.0.4（发行版）与 master `351297cdce`（6.1.0-prealpha）
-**环境：** Arch Linux、KDE Plasma 6、Wayland 会话（Krita 运行于 XWayland，`QT_QPA_PLATFORM=xcb`）、Qt **6.11.2**、
-KF6 6.30.0、`plasma-integration` 6.7.5；对照 Qt 5.15.19
+经 DeepSeek V4.1 Flash 分析找出原因，并给出最小复现以供验证。
+
+**环境：** Arch Linux、KDE Plasma 6（Wayland 会话，Krita 运行于 XWayland，`QT_QPA_PLATFORM=xcb`）、Qt **6.11.2**、
+KF6 6.30.0、`plasma-integration` 6.7.5；Krita master `351297cdce`（6.1.0-prealpha）与 6.0.4；对照 Qt 5.15.19
+
 **报告时间：** 2026-10-03
-**根因定位与最小复现：** 由 **DeepSeek Harness coding agent** 与报告者共同完成
 
-> **本报告以中文为准**，下方英文部分为同一内容的翻译。
+## 一、概述
 
----
+此部分给出简要分析及缓解措施。
 
-## 一、现象
+### 1.1 根因
 
-* Krita 获得焦点时，Plasma 的「应用程序菜单」组件（全局菜单）**始终空白**。
-* Krita 窗口内**也没有菜单栏**，因此完全没有菜单可用。
-* 设 `KDE_NO_GLOBAL_MENU=1` 可以让窗口内菜单栏出现（经典绕过方式）。
-* Krita 5.x（Qt 5 构建）没有此问题。
+在 Krita 的真实应用对象存在之前，`KisOpenGLModeProber` 会为了探测 OpenGL 渲染器创建一个临时
+`QGuiApplication`、一个 `QWindow` 和一个 `QOpenGLContext`，随后销毁。在 Qt 6 中，销毁这个探测 `QWindow` 时
+会调用 `QAccessible::isActive()`（Qt 5.15 的 `QWindow` 析构函数里没有这个判断），这次调用会经 xcb 或 wayland 的
+QPA 插件实例化无障碍实现（at-spi 桥），从而建立 session bus 连接—— **建立连接时进程里已经存在 `qApp`，而它恰好
+是这个临时的 `QGuiApplication`**，这一点决定了后面由谁来"恢复投递"。
 
-菜单本身**已经正确导出**：`/MenuBar/N` 已注册，Plasma 的 appmenu 模块也把
-`_KDE_NET_WM_APPMENU_SERVICE_NAME` / `_OBJECT_PATH` 写到了 Krita 窗口上。
-真正失效的是——Krita **从不回应**读取该对象的那些 D-Bus 调用。
+Qt 的 D-Bus 连接是 **进程级**资源。当连接在主线程上建立、且进程里已存在 `qApp` 时
+（`bool suspendedDelivery = QThread::isMainThread() && qApp;`），`QDBusConnectionManager::doConnectToStandardBus()`
+会执行 `if (c && suspendedDelivery) d->setDispatchEnabled(false);`，即 **先把投递挂起**，再用
+`QMetaObject::invokeMethod` 把"稍后（事件循环开始后）把 `dispatchEnabled` 置回 `true`"排队投递给 **那个 `qApp`**。
+需要说明的是：`dispatchEnabled == false` 本身是正常应用也会经历的 **临时初始态**（`exec()` 运行后即被置回 `true`
+并清空积压消息）；真正致命的是下面两步。
 
-## 二、根因（一段话）
+那个临时的 `QGuiApplication` 在任何事件循环运行之前就被销毁，于是这个排队调用随接收者一起被撤销，
+`setDispatchEnabled(true)` 永远不会执行；而连接对象被全局的 `QDBusConnectionManager` 持有
+（`connectionHash` 加上裸指针 `defaultBuses[]`），应用析构时 QtDBus 不做任何清理。之后真实应用的
+`QDBusConnection::sessionBus()` 命中 `if (defaultBuses[type]) return defaultBuses[type];` 直接早退，拿到的仍是
+这条 `dispatchEnabled == false` 的连接， **并且不会再重新安排一次恢复**。于是进程再也不回应任何入站的 D-Bus
+方法调用，全局菜单就为空了。
 
-在 Krita 的真实应用对象存在之前，`KisOpenGLModeProber` 会为了探测 OpenGL 渲染器创建一个**临时
-`QGuiApplication`**（以及一个 `QWindow` 和一个 `QOpenGLContext`），随后销毁。在 Qt 6 中，**销毁这个探测窗口时
-会调用 `QAccessible::isActive()`**（Qt 5.15 的 `QWindow` 析构函数里没有这个判断），这次调用会经 xcb 或 wayland
-的 QPA 插件实例化无障碍实现（at-spi 桥），从而**在那个临时应用仍是 `qApp` 的时候，建立了进程级的 session bus
-连接**。Qt 的 D-Bus 连接是**进程级**资源；而"稍后恢复消息投递"这一步是**排队投递给建立连接时存在的那个
-`qApp`** 的，那个 `qApp` 销毁后，这个绑定**不会被更新、也不会重新安排**；真实应用的 `QDBusConnection::sessionBus()`
-拿到的仍是缓存下来的同一条连接（`dispatchEnabled == false`），于是进程再也不回应任何入站的 D-Bus 方法调用，
-Plasma 的 applet 只能超时。
+### 1.2 缓解措施
 
-## 三、调用链
+根据原因分析可知，只需阻止无障碍实现建立 session bus 连接即可缓解该问题。我询问 DeepSeek 该怎样阻止，
+其分析 Qt 源码后说明：把 `AT_SPI_BUS_ADDRESS` 设为非空值，`QAtSpiDBusConnection` 的构造函数会走 early-return，
+直接改用该变量指定的无障碍总线，从而根本不会调用 `QDBusConnection::sessionBus()`。
+副作用是：该地址无效时，该进程的无障碍功能会失效。
 
-### 3.1 Krita 侧：真实应用之前先构造了一个完整而短命的应用对象
+经实际测试，`AT_SPI_BUS_ADDRESS=1 krita` 实例的全局菜单正常，与上述分析一致。
 
-`krita/main.cc:442` → `KisOpenGL::selectSurfaceConfig()`（`libs/ui/opengl/kis_opengl.cpp:910`）→
-`KisOpenGLModeProber::probeFormat(config, adjustGlobalState = true)`（`libs/ui/opengl/KisOpenGLModeProber.cpp`）。
-这段代码本身**已经主动避免让探测应用接触 D-Bus**：
+## 二、调用链
+
+此部分由 DeepSeek V4.1 Flash 生成。
+
+### 2.1 Krita 侧：真实应用之前先构造了一个完整而短命的应用对象
+
+`krita/main.cc:442` → `KisOpenGL::selectSurfaceConfig()`（`libs/ui/opengl/kis_opengl.cpp:910`，定义处）→
+`KisOpenGLModeProber::probeFormat(config, adjustGlobalState = true)`
+（`libs/ui/opengl/KisOpenGLModeProber.cpp`）。这段代码本身 **已经主动避免让探测应用接触 D-Bus**：
 
 ```cpp
-// libs/ui/opengl/KisOpenGLModeProber.cpp（节选）
-QScopedPointer<EnvironmentSetter> portalSetter;                       // ~180 行
-portalSetter.reset(new EnvironmentSetter(QLatin1String("QT_NO_XDG_DESKTOP_PORTAL"), QLatin1String("1")));
+// libs/ui/opengl/KisOpenGLModeProber.cpp（节选，行号为实际值）
+QScopedPointer<EnvironmentSetter> portalSetter;
+portalSetter.reset(new EnvironmentSetter(QLatin1String("QT_NO_XDG_DESKTOP_PORTAL"), QLatin1String("1")));   // 183 行
 ...
 if (runningInKDE && !isInAppimage)
-    QGuiApplication::setDesktopSettingsAware(false);                  // ~188-190 行
+    QGuiApplication::setDesktopSettingsAware(false);                  // 192 行
 ...
-QScopedPointer<QGuiApplication> application(new QGuiApplication(argc, &argv));   // ~195 行
+application.reset(new QGuiApplication(argc, &argv));                  // 195 行
 ...
-QWindow surface; ... surface.create();                                // ~203-206 行
+QWindow surface;                                                      // 203 行
+surface.create();                                                     // 206 行
 QOpenGLContext context; ...                                           // GL 探测
 // 函数返回：QWindow 先析构，随后 QGuiApplication 析构
 ```
@@ -60,9 +72,12 @@ QOpenGLContext context; ...                                           // GL 探�
 * `setDesktopSettingsAware(false)` 阻止在探测应用里创建 KDE 平台主题（及其 `KIconLoader` / `KConfigWatcher`
   的 D-Bus 使用）。
 
+另外，该文件 **从不调用 `show()`**（已 grep 确认），探测窗口只 `create()`、从不显示、也从不获得焦点，
+因此不会产生显示/焦点类无障碍事件。
+
 `krita/main.cc:377` 另有那个临时 `QCoreApplication`，实测无害（只有 core 应用时不会建立 D-Bus 连接）。
 
-### 3.2 Qt 6 新增：`QWindow` 析构里的无障碍查询（Qt 5 没有）
+### 2.2 Qt 6 新增：`QWindow` 析构里的无障碍查询（Qt 5 没有）
 
 ```cpp
 // qtbase/src/gui/kernel/qwindow.cpp:178-181 (v6.11.2)
@@ -75,7 +90,7 @@ QWindow::~QWindow()
 #endif
 ```
 
-Qt 5.15 的析构函数里**完全没有无障碍代码**：
+Qt 5.15 的析构函数里 **完全没有无障碍代码**：
 
 ```cpp
 // qtbase/src/gui/kernel/qwindow.cpp (v5.15)
@@ -89,15 +104,19 @@ QWindow::~QWindow()
 ```
 
 Qt 6 这段代码的意图是合理的：在宣告"某窗口的可访问对象消失了"之前，先判断无障碍是否启用
-（`QAccessible::isActive()` 的文档正是建议用它来"避免不必要的昂贵通知"）。问题在于——**这个"廉价守卫"并不廉价**：
-`QAccessible::isActive()` 必须先向平台插件索要无障碍实现。
+（`QAccessible::isActive()` 的文档正是 **建议**把它当作"避免昂贵通知"的廉价守卫使用）。
+问题在于：`QAccessible::isActive()` 自身确实很廉价——它只是转发给 `QPlatformAccessibility::isActive()`
+（即 `return m_active;`）——但 **QPA 集成把"取得平台无障碍对象"实现成了懒加载**：
+`QXcbIntegration::accessibility()` / `QWaylandIntegration::accessibility()` 会在第一次被查询时
+`new QSpiAccessibleBridge()`。于是这个"廉价守卫"带上了"实例化 at-spi 桥并建立 D-Bus 连接"的副作用，
+与该文档建议的用法/意图不符。
 
 在探测应用里，其它任何地方都不会碰无障碍：Qt 6 中一个裸 `QWindow` 与无障碍相关的调用点只有 4 处
 （`~QWindow` 的 ObjectDestroyed、`QWindow::setParent` 的 ParentChanged、`QWindow::event()` 的 FocusIn/FocusOut），
-而 `QWindow` **根本不发送创建/显示类事件**。探测窗口从未 show、从未获得焦点，因此**它的析构就是探测应用整个
+而 `QWindow` **根本不发送创建/显示类事件**。探测窗口从未 show、从未获得焦点，因此 **它的析构就是探测应用整个
 生命里第一次、也是唯一一次索要无障碍实现**。
 
-### 3.3 这次查询经 QPA 插件实例化 at-spi 桥并建立 D-Bus 连接
+### 2.3 这次查询经 QPA 插件实例化 at-spi 桥并建立 D-Bus 连接
 
 ```cpp
 // src/gui/accessible/qaccessible.cpp
@@ -153,7 +172,8 @@ QAtSpiDBusConnection::QAtSpiDBusConnection(QObject *parent) : ... {
     ...
 ```
 
-gdb 实证（在 `QDBusConnection::sessionBus()` 上打断点，探测期间的第一次命中）：
+gdb 实证—— **该调用栈采集自最小复现器**（其探测结构与 Krita 的 `probeFormat()` 相同），并非直接 attach 真实 Krita；
+真实 Krita 在 Qt 6 下的跨进程探针结果与之完全一致。方法：在 `QDBusConnection::sessionBus()` 上打断点，取探测期间的第一次命中：
 
 ```
 #0 QDBusConnection::sessionBus()                      libQt6DBus
@@ -166,13 +186,13 @@ gdb 实证（在 `QDBusConnection::sessionBus()` 上打断点，探测期间的�
 #7 main()
 ```
 
-### 3.4 Qt 的 D-Bus 连接是进程级的，而"恢复投递"绑定在被销毁的那个 qApp 上
+### 2.4 Qt 的 D-Bus 连接是进程级的，而"恢复投递"绑定在被销毁的那个 qApp 上
 
 **（a）连接属于进程，不属于任何应用对象。** 它由全局单例持有
 （`Q_GLOBAL_STATIC(QDBusConnectionManager, _q_manager)`），存放在 `connectionHash` 中，并被裸指针
 `defaultBuses[type]` 缓存，靠 `QDBusConnectionPrivate::ref`（初值 1）维持生命。探测应用的 `QGuiApplication`
 析构只会执行 `QGuiApplicationPrivate::cleanup()`（`delete platform_theme; delete platform_integration;`，
-`qguiapplication.cpp:1886-1891`），也就是只销毁这条连接的**使用者**；QtDBus 没有任何"随应用销毁而清理"的逻辑，
+`qguiapplication.cpp:1886-1891`），也就是只销毁这条连接的 **使用者**；QtDBus 没有任何"随应用销毁而清理"的逻辑，
 全局 manager 直到进程退出才销毁（而它的析构也只是停掉自己的线程）。
 
 **（b）"稍后恢复投递"这一步绑定在建立连接时存在的那个 `qApp` 上。**
@@ -210,7 +230,7 @@ if (defaultBuses[type])
 `defaultBuses[]` 只在 manager 构造函数里被初始化为 `nullptr`，此后永不重置；
 `QDBusConnection::disconnectFromBus("qt_default_session_bus")` 也清不掉它（`removeConnection()` 只删
 `connectionHash` 里的条目）。于是这条连接在进程余下的整个生命周期里始终 `dispatchEnabled == false`，
-它与那个已销毁 `qApp` 的关联也**永远处于失效状态**。
+它与那个已销毁 `qApp` 的关联也 **永远处于失效状态**。
 
 **（d）可观察结果：**
 
@@ -231,78 +251,23 @@ Plasma 也记住了 `(:service, /MenuBar/N)`；但 applet 对该对象的 `GetLa
 同时 Qt 认为存在原生全局菜单栏，于是把窗口内菜单栏隐藏。`KDE_NO_GLOBAL_MENU=1` 会让 `createPlatformMenuBar()`
 返回 `nullptr`，Qt 就把菜单栏画回窗口内。
 
-## 四、证据
+## 三、为什么回报给 KDE 而不是 Qt
 
-* **跨进程探针**：对 Krita 导出的菜单对象做 `Introspect` / `GetLayout` / `AboutToShow` 全部超时；
-  `org.freedesktop.DBus.Peer.Ping` 有应答。开 `QDBUS_DEBUG=1` 时 Krita 自己对每个调用打印 `delivery is suspended`。
-* **菜单确实注册成功**：`xprop` 可见 `_KDE_NET_WM_APPMENU_SERVICE_NAME` / `_OBJECT_PATH`，registrar 也返回
-  `(':1.x', '/MenuBar/N')`——因此这不是注册问题，也不是 KWin 问题。
-* **gdb 调用栈**：探测应用里第一次 `QDBusConnection::sessionBus()` 的完整栈（见 3.3）。
-* **最小复现器二分**（带窗口的 Qt 5 / Qt 6 程序，可在真实 `QApplication` 之前选择性创建临时
-  `QGuiApplication` / `QWindow`）：
+此部分由 DeepSeek V4.1 Flash 生成。
 
-  | 配置 | `isNativeMenuBar()` | `/MenuBar/1` 注册 | 跨进程 `Introspect`/`AboutToShow` |
-  |---|---|---|---|
-  | 普通应用 | true | true | 0 / 0 |
-  | 只创建临时 `QCoreApplication` | true | true | 0 / 0 |
-  | 临时 `QGuiApplication`，不建 `QWindow` | true | true | 0 / 0 |
-  | **临时 `QGuiApplication` + `QWindow`（即 Krita prober）** | true | true | **124 / 124（超时）** |
-  | 同上，但探测期间 `AT_SPI_BUS_ADDRESS` 非空 | true | true | **0 / 0** |
-  | 同上，但探测期间把 `DBUS_SESSION_BUS_ADDRESS` 指向死地址 | false | false | 对象根本没注册 |
-
-  （`124` = 调用超时无应答。）Qt 5 在上述所有配置下都正常，**唯一例外**是探测应用真的建立了 session bus 时
-  （也就是 Krita 的 Qt 5 构建用 `QT_NO_XDG_DESKTOP_PORTAL=1` 挡住的那条路径）。
-
-## 五、为什么回报给 KDE 而不是 Qt
-
-* 请注意：**在 Krita 真实运行之前构造那个应用对象的过程中，已有代码排除了大部分可能产生 D-Bus 连接的功能**
-  （见 3.1：portal 监听与 KDE 平台主题都被显式关掉，另有提交 `8d6a2a5d12` / BUG 408015 处理过同类问题）。
-  由此**猜测 Krita 此前可能已经考虑过 Qt D-Bus 连接管理器的行为**。
+* 在 Krita 真实运行之前构造那个应用对象的过程中，已有代码排除了大部分可能产生 D-Bus 连接的功能。
+  由此猜测 Krita 此前可能已经考虑过 Qt D-Bus 连接管理器的行为。
 * 基于这一点，本报告先提交给 KDE：它记录的是 Krita 侧可观察到的症状、可复现步骤以及一个可在 Krita 侧落地的
-  缓解办法（见第六节）；修复 Krita 侧也足以消除该症状。
-* 不过从机制上看，这更像是 **Qt 的缺陷**：把"恢复投递"绑定到一个稍后会被销毁的 `qApp`（`enableDispatchDelayed(qApp)`），
-  并且缓存连接（`defaultBuses[]`）被交给新的 `qApp` 时不做任何重新绑定或重新安排恢复。
-* **我（报告者）并未确认 Qt 那边是否已有相关问题报告**（Qt 的 bug tracker 需要账号，我没有去检索/提交）。
-  如果有熟悉 Qt 的开发者能够确认这确实是 Qt 的 bug，**希望您能帮忙向 Qt 报告**（bugreports.qt.io，项目 QTBUG，
-  组件 DBus / 相关：GUI: Accessibility）。我可以提供最小复现程序（约 30 行的单文件版本，或带窗口的
-  Qt 5/Qt 6 复现器）以及完整的调用栈证据，需要的话请在下面留言。
+  缓解办法（见 1.2）；修复 Krita 侧也足以消除该症状。
+* 不过从机制上看，这更像是 Qt 的缺陷：
+    * 一是连接管理器将连接缓存在 `defaultBuses[]`，
+      而它与 `qApp` 的绑定（`enableDispatchDelayed(qApp)`）不会随应用对象更替而更新，也不会在交出缓存连接时重新安排；
+    * 二是 `QAccessible::isActive()` 会因 QPA 集成把 `accessibility()` 实现为懒加载而实例化
+      at-spi 桥、建立 D-Bus 连接，这与该函数被建议的使用方式（廉价守卫）不符。
+* 我并未确认 Qt 那边是否已有相关问题报告。如果有熟悉 Qt 的开发者能够确认这确实是 Qt 的 bug，希望您能帮忙向 Qt 报告。
+  Qt 侧更详细的技术描述见随附的 `QTBUG-REPORT.md`。
 
-## 六、缓解办法：把 `AT_SPI_BUS_ADDRESS` 设为非空
-
-**在临时探测应用存活期间，把 `AT_SPI_BUS_ADDRESS` 设为任意非空值**（Krita 现成的 `EnvironmentSetter` RAII 模式
-正好适用），并在真实应用创建之前清掉探测应用留下的无障碍连接：
-
-```cpp
-// KisOpenGLModeProber::probeFormat() 中，与现有 portal guard 并列
-a11ySetter.reset(new EnvironmentSetter(QLatin1String("AT_SPI_BUS_ADDRESS"),
-                                       QLatin1String("unix:path=/nonexistent-krita-probe")));
-...
-// 所有探测应用销毁之后、KisApplication 构造之前
-QDBusConnection::disconnectFromBus(QStringLiteral("a11y"));
-```
-
-原理：at-spi 桥会走 3.3 节那段 early-return，探测期间**根本不会调用 `QDBusConnection::sessionBus()`**；
-进程的第一条 session bus 连接因此由真实应用建立，而它的事件循环会真正运行，"延迟恢复投递"得以正常执行，
-面板就会显示 Krita 的菜单。实测：加上这道保险后，导出的对象立即有应答，且不再需要 `KDE_NO_GLOBAL_MENU`。
-
-注意事项：
-
-* 只应作用在探测应用期间。全局设置同样能遮住现象，但会静默地让整个 Krita 进程失去无障碍支持。
-* `disconnectFromBus("a11y")` 是必要的：探测应用的桥已经在那个地址名下建立了一条命名连接。
-* 这道保险**不能**被 KDE 平台主题 guard 或 portal guard 替代，两者都必须保留（实测：与
-  `--no-portal-guard` 组合时仍然复现）。
-
-## 七、建议的修法
-
-* **Krita（根治）**：不要在进程里创建第二个 `QGuiApplication`。要么把探测搬进真实应用（在任何可见窗口创建之前
-  使用 `QOffscreenSurface` / 隐藏 `QWindow`，并重构 `probeFormat(adjustGlobalState = true)` 目前在应用构造前
-  设置的 `Qt::AA_*` 属性）；要么把探测放进**子进程**（`krita --probe-opengl …`）。在完成之前，保留现有 guard，
-  并加上第六节的 `AT_SPI_BUS_ADDRESS` 保险作为过渡。
-* **Qt（上游）**：让"延迟恢复投递"不依赖建立连接时恰好存在的那个应用对象；或在
-  `QDBusConnectionManager::busConnection()` 交出仍是 suspended 的缓存连接时重新安排一次恢复。另外建议不要把
-  **失败**的连接也无条件缓存进 `defaultBuses[]`。
-
-## 八、相关报告
+## 四、相关报告
 
 * KDE bug 483170 — appmenu (global menu) doesn't work with krita on plasma 6
 * KDE bug 515889 — [qt6] Application Menu is unavailable on Krita 6
@@ -310,75 +275,104 @@ QDBusConnection::disconnectFromBus(QStringLiteral("a11y"));
 * Krita 提交 `8d6a2a5d12` — "Do not load the platform theme when created a test QApplication"（BUG 408015）
 
 ---
----
 
-# English version (translation — the Chinese text above is authoritative)
+> **Translator’s note:** The Chinese original is authoritative. This English version was translated by DeepSeek V4.1
+> Flash. In the Chinese original, the sentence “此部分由 DeepSeek V4.1 Flash 生成。” literally means “This section was
+> generated by DeepSeek V4.1 Flash.” It indicates that the corresponding part of the Chinese original was generated by AI;
+> it does not refer to this English translation.
 
-# Bug report: Krita 6 (Qt 6) — Plasma global menu stays empty because the session-bus connection belongs to a throw-away QApplication created during OpenGL probing
+# Root Cause Analysis: Plasma Global Menu Blank under Krita 6 (Qt 6)
 
-**Product / component:** krita / general (Qt 6 builds)
-**Version:** 6.0.4 (distro) and master `351297cdce` (6.1.0-prealpha)
-**Environment:** Arch Linux, KDE Plasma 6, Wayland session with Krita on XWayland (`QT_QPA_PLATFORM=xcb`), Qt **6.11.2**,
-KF6 6.30.0, `plasma-integration` 6.7.5, Qt 5.15.19 for comparison
-**Reported:** 2026-10-03 · root-cause analysis and minimal reproducer by the **DeepSeek Harness coding agent** together
-with the reporter
+The cause was identified through analysis by DeepSeek V4.1 Flash, and a minimal reproduction is provided for
+verification.
 
-## 1. Symptom
+**Environment:** Arch Linux, KDE Plasma 6 (Wayland session, Krita running under XWayland, `QT_QPA_PLATFORM=xcb`), Qt
+**6.11.2**, KF6 6.30.0, `plasma-integration` 6.7.5; Krita master `351297cdce` (6.1.0-prealpha) and 6.0.4; compared
+against Qt 5.15.19  
+**Report date:** 2026-10-03
 
-* The Plasma *Application Menu* widget stays **empty** while Krita is focused.
-* Krita's own menu bar is **not drawn inside the window** either, so there is no menu at all.
-* `KDE_NO_GLOBAL_MENU=1` makes the in-window menu bar appear (the classic workaround).
-* Krita 5.x (Qt 5 build) is unaffected.
+## I. Overview
 
-The menu **is** exported correctly: `/MenuBar/N` is registered and Plasma's appmenu module writes
-`_KDE_NET_WM_APPMENU_SERVICE_NAME` / `_OBJECT_PATH` onto Krita's window. What fails is that Krita
-**never replies** to the calls that read that object.
+This section gives a brief analysis and mitigations.
 
-## 2. Root cause in one paragraph
+### 1.1 Root Cause
 
-Before Krita's real application object exists, `KisOpenGLModeProber` creates a **throw-away `QGuiApplication`**
-(plus a `QWindow` and a `QOpenGLContext`) to probe the OpenGL renderers, and destroys it again. In Qt 6,
-**destroying that probe's `QWindow` calls `QAccessible::isActive()`** — a check that Qt 5.15's `QWindow`
-destructor does not have — and that call makes the xcb or wayland QPA plugin instantiate its accessibility
-implementation (the at-spi bridge), which **opens the process-wide session-bus connection while the throw-away
-application is still the current `qApp`**. Qt's D-Bus connection is a **process-level** resource, and the step
-that re-enables message delivery was queued **on the `qApp` that existed when the connection was created**;
-when that `qApp` is destroyed, the binding is **neither updated nor re-armed**, so the real application's
-`QDBusConnection::sessionBus()` returns the same cached connection (`dispatchEnabled == false`). From then on
-the process never answers incoming D-Bus method calls, and the Plasma applet can only time out.
+Before Krita’s real application object exists, `KisOpenGLModeProber` creates a temporary `QGuiApplication`, a `QWindow`,
+and a `QOpenGLContext` in order to probe the OpenGL renderer, and then destroys them. In Qt 6, destroying this probe
+`QWindow` calls `QAccessible::isActive()` (Qt 5.15’s `QWindow` destructor did not have this check). This call
+instantiates the accessibility implementation (the at-spi bridge) through the xcb or wayland QPA plugin, thereby
+establishing a session bus connection— **when the connection is established, `qApp` already exists in the process, and
+it happens to be this temporary `QGuiApplication`**, which determines who will later “resume delivery.”
 
-## 3. The chain, step by step
+Qt’s D-Bus connections are **process-level** resources. When a connection is established on the main thread and `qApp`
+already exists in the process (`bool suspendedDelivery = QThread::isMainThread() && qApp;`),
+`QDBusConnectionManager::doConnectToStandardBus()` executes `if (c && suspendedDelivery) d->setDispatchEnabled(false);`,
+i.e. **it first suspends delivery**, then uses `QMetaObject::invokeMethod` to queue “later (after the event loop starts)
+set `dispatchEnabled` back to `true`” for delivery to **that `qApp`**. It should be noted that
+`dispatchEnabled == false` itself is a **temporary initial state** that normal applications also go through (after
+`exec()` runs it is set back to `true` and backlog messages are cleared); what is truly fatal are the following two
+steps.
 
-### 3.1 Krita creates a complete, short-lived application object before the real one
+That temporary `QGuiApplication` is destroyed before any event loop runs, so this queued call is cancelled together with
+its receiver, and `setDispatchEnabled(true)` is never executed; the connection object is held globally by
+`QDBusConnectionManager` (`connectionHash` plus the raw pointer `defaultBuses[]`), and QtDBus does not perform any
+cleanup when the application is destroyed. Afterwards, the real application’s `QDBusConnection::sessionBus()` hits
+`if (defaultBuses[type]) return defaultBuses[type];` and returns early, still getting this connection with
+`dispatchEnabled == false`, **and it will not schedule another resumption**. Therefore, the process never again responds
+to any inbound D-Bus method calls, and the global menu is empty.
 
-`krita/main.cc:442` → `KisOpenGL::selectSurfaceConfig()` (`libs/ui/opengl/kis_opengl.cpp:910`) →
-`KisOpenGLModeProber::probeFormat(config, adjustGlobalState = true)` (`libs/ui/opengl/KisOpenGLModeProber.cpp`).
-That code already takes care to keep the probe application off D-Bus:
+### 1.2 Mitigation
+
+From the root cause analysis, it can be seen that simply preventing the accessibility implementation from establishing a
+session bus connection is enough to mitigate the problem. I asked DeepSeek how to prevent it. After analyzing the Qt
+source code, it explained: set `AT_SPI_BUS_ADDRESS` to a non-empty value; then `QAtSpiDBusConnection`’s constructor will
+take an early return and directly use the accessibility bus specified by that variable, thus never calling
+`QDBusConnection::sessionBus()`. The side effect is: if that address is invalid, accessibility in that process will stop
+working.
+
+Actual testing confirmed: the global menu of an instance launched as `AT_SPI_BUS_ADDRESS=1 krita` works normally,
+consistent with the above analysis.
+
+## II. Call Chain
+
+> **Translator’s note:** In the Chinese original, this section is preceded by “此部分由 DeepSeek V4.1 Flash 生成。”,
+> meaning this section of the Chinese original was generated by AI. Rendered literally: “This section was generated by
+> DeepSeek V4.1 Flash.”
+
+### 2.1 Krita Side: A Complete but Short-Lived Application Object Is Constructed Before the Real Application
+
+`krita/main.cc:442` → `KisOpenGL::selectSurfaceConfig()` (`libs/ui/opengl/kis_opengl.cpp:910`, definition) →
+`KisOpenGLModeProber::probeFormat(config, adjustGlobalState = true)` (`libs/ui/opengl/KisOpenGLModeProber.cpp`). This
+code itself **already actively avoids letting the probe application touch D-Bus**:
 
 ```cpp
-// libs/ui/opengl/KisOpenGLModeProber.cpp  (abridged)
-QScopedPointer<EnvironmentSetter> portalSetter;                        // ~line 180
-portalSetter.reset(new EnvironmentSetter(QLatin1String("QT_NO_XDG_DESKTOP_PORTAL"), QLatin1String("1")));
+// libs/ui/opengl/KisOpenGLModeProber.cpp (excerpt; line numbers are actual values)
+QScopedPointer<EnvironmentSetter> portalSetter;
+portalSetter.reset(new EnvironmentSetter(QLatin1String("QT_NO_XDG_DESKTOP_PORTAL"), QLatin1String("1")));   // line 183
 ...
 if (runningInKDE && !isInAppimage)
-    QGuiApplication::setDesktopSettingsAware(false);                   // ~lines 188-190
+    QGuiApplication::setDesktopSettingsAware(false);                  // line 192
 ...
-QScopedPointer<QGuiApplication> application(new QGuiApplication(argc, &argv));   // ~line 195
+application.reset(new QGuiApplication(argc, &argv));                  // line 195
 ...
-QWindow surface; ... surface.create();                                 // ~lines 203-206
-QOpenGLContext context; ...                                            // GL probing
-// function returns: the QWindow, then the QGuiApplication, are destroyed
+QWindow surface;                                                      // line 203
+surface.create();                                                     // line 206
+QOpenGLContext context; ...                                           // GL probing
+// Function returns: QWindow is destructed first, then QGuiApplication is destructed
 ```
 
-* `QT_NO_XDG_DESKTOP_PORTAL=1` prevents the portal-based settings watcher (`QDesktopUnixServices`) from opening
-  the session bus while the probe is alive.
-* `setDesktopSettingsAware(false)` prevents the KDE platform theme (and its `KIconLoader` / `KConfigWatcher`
-  D-Bus usage) from being created inside the probe.
+* `QT_NO_XDG_DESKTOP_PORTAL=1` prevents portal-based settings monitoring (`QDesktopUnixServices`) from establishing a
+  connection during probing;
+* `setDesktopSettingsAware(false)` prevents creation of the KDE platform theme (and its `KIconLoader` / `KConfigWatcher`
+  D-Bus usage) in the probe application.
 
-The separate temporary `QCoreApplication` in `krita/main.cc:377` is measured to be harmless (a core application
-alone never creates a D-Bus connection).
+In addition, this file **never calls `show()`** (confirmed by grep); the probe window is only `create()`d, never shown,
+and never receives focus, so it does not produce display/focus accessibility events.
 
-### 3.2 Qt 6 added an accessibility query to `QWindow`'s destructor (Qt 5 has none)
+`krita/main.cc:377` also has that temporary `QCoreApplication`, which was measured to be harmless (with only a core
+application, no D-Bus connection is established).
+
+### 2.2 New in Qt 6: Accessibility Query in the `QWindow` Destructor (Not in Qt 5)
 
 ```cpp
 // qtbase/src/gui/kernel/qwindow.cpp:178-181 (v6.11.2)
@@ -391,7 +385,7 @@ QWindow::~QWindow()
 #endif
 ```
 
-Qt 5.15's destructor contains **no accessibility code at all**:
+Qt 5.15’s destructor has **no accessibility code at all**:
 
 ```cpp
 // qtbase/src/gui/kernel/qwindow.cpp (v5.15)
@@ -404,25 +398,29 @@ QWindow::~QWindow()
 }
 ```
 
-The intent of the Qt 6 code is sound: before announcing that a window's accessible object has disappeared, ask
-whether accessibility is active at all (the documentation of `QAccessible::isActive()` explicitly recommends it
-as a guard "to prevent expensive notifications"). The problem is that this "cheap guard" is not cheap:
-`QAccessible::isActive()` first has to obtain the platform accessibility implementation.
+The intent of this Qt 6 code is reasonable: before announcing that “some window’s accessible object has disappeared,”
+first check whether accessibility is enabled (the documentation of `QAccessible::isActive()` indeed **recommends** using
+it as a cheap guard to “avoid expensive notifications”). The problem is: `QAccessible::isActive()` itself is indeed
+cheap—it just forwards to `QPlatformAccessibility::isActive()` (i.e. `return m_active;`)—but **the QPA integration
+implements “get the platform accessibility object” as lazy initialization**: `QXcbIntegration::accessibility()` /
+`QWaylandIntegration::accessibility()` will, on first query, `new QSpiAccessibleBridge()`. Thus this “cheap guard”
+carries the side effect of “instantiating the at-spi bridge and establishing a D-Bus connection,” which does not match
+the documented recommended use/intent.
 
-In the probe application nothing else ever touches accessibility: a bare `QWindow` has exactly four
-accessibility-related call sites in Qt 6 (`~QWindow` = ObjectDestroyed, `QWindow::setParent` = ParentChanged,
-`QWindow::event()` FocusIn/FocusOut = state changes), and no creation/show event is sent for a `QWindow` at all.
-The probe's window is never shown and never focused, so **its destruction is the first — and only — point at
-which the probe application ever asks for accessibility**.
+In the probe application, nothing else touches accessibility: in Qt 6, a bare `QWindow` has only 4 accessibility-related
+call sites (`~QWindow`’s ObjectDestroyed, `QWindow::setParent`’s ParentChanged, `QWindow::event()`’s FocusIn/FocusOut),
+and `QWindow` **does not send creation/show events at all**. The probe window is never shown and never focused, so **its
+destruction is the first and only time in the probe application’s entire life that it asks for the accessibility
+implementation**.
 
-### 3.3 That query instantiates the at-spi bridge via the QPA plugin and creates the D-Bus connection
+### 2.3 This Query Instantiates the at-spi Bridge via the QPA Plugin and Establishes a D-Bus Connection
 
 ```cpp
 // src/gui/accessible/qaccessible.cpp
 static QPlatformAccessibility *platformAccessibility()
 {
     QPlatformIntegration *pfIntegration = QGuiApplicationPrivate::platformIntegration();
-    return pfIntegration ? pfIntegration->accessibility() : nullptr;      // virtual -> QPA plugin
+    return pfIntegration ? pfIntegration->accessibility() : nullptr;      // virtual function → QPA plugin
 }
 bool QAccessible::isActive()
 {
@@ -456,52 +454,54 @@ QPlatformAccessibility *QWaylandIntegration::accessibility() const
 }
 ```
 
-`QSpiAccessibleBridge`'s constructor creates `QAtSpiDBusConnection`, which opens the bus
+`QSpiAccessibleBridge`’s constructor creates `QAtSpiDBusConnection`, which opens the bus
 (`src/gui/accessible/linux/dbusconnection.cpp`):
 
 ```cpp
 QAtSpiDBusConnection::QAtSpiDBusConnection(QObject *parent) : ... {
     QByteArray addressEnv = qgetenv("AT_SPI_BUS_ADDRESS");
-    if (!addressEnv.isEmpty()) {                 // non-empty -> never touches the session bus
+    if (!addressEnv.isEmpty()) {                 // if non-empty, session bus is not touched at all
         m_enabled = true;
         connectA11yBus(QString::fromLocal8Bit(addressEnv));
         return;
     }
-    QDBusConnection c = QDBusConnection::sessionBus();   // ← the process-wide session bus is created here
+    QDBusConnection c = QDBusConnection::sessionBus();   // ← the process-level session bus is established here
     ...
 ```
 
-Confirmed with gdb (breakpoint on `QDBusConnection::sessionBus()`, first hit during the probe):
+gdb evidence— **this call stack was collected from a minimal reproducer** (whose probe structure is the same as Krita’s
+`probeFormat()`), not by directly attaching to real Krita; real Krita’s cross-process probe result under Qt 6 is exactly
+the same. Method: set a breakpoint on `QDBusConnection::sessionBus()` and take the first hit during probing:
 
 ```
 #0 QDBusConnection::sessionBus()                      libQt6DBus
-#1 ??                                                 libQt6Gui   (= QAtSpiDBusConnection ctor)
+#1 ??                                                 libQt6Gui   (i.e. QAtSpiDBusConnection constructor)
 #2 QSpiAccessibleBridge::QSpiAccessibleBridge()       libQt6Gui
 #3 QXcbIntegration::accessibility() const              libQt6XcbQpa
 #4 QAccessible::isActive()                             libQt6Gui
-#5 QWindow::~QWindow()                                 libQt6Gui   ← the trigger
-#6 probe iteration (same structure as KisOpenGLModeProber)
+#5 QWindow::~QWindow()                                 libQt6Gui   ← trigger point
+#6 probe iteration (structure same as KisOpenGLModeProber)
 #7 main()
 ```
 
-### 3.4 Qt's D-Bus connection is process-level, and the "resume delivery" step is bound to the destroyed qApp
+### 2.4 Qt’s D-Bus Connection Is Process-Level, and “Resume Delivery” Is Bound to the Destroyed qApp
 
-**(a) The connection belongs to the process, not to any application object.** It is owned by a global singleton
-(`Q_GLOBAL_STATIC(QDBusConnectionManager, _q_manager)`), kept in `connectionHash`, cached through the raw
-`defaultBuses[type]` pointer, and held alive by `QDBusConnectionPrivate::ref` (initial value 1). Destroying the
-probe's `QGuiApplication` only runs `QGuiApplicationPrivate::cleanup()`
-(`delete platform_theme; delete platform_integration;`, `qguiapplication.cpp:1886-1891`) — i.e. it destroys only
-the *users* of that connection. QtDBus has no per-application teardown, and the global manager is destroyed only
-at process exit (and even then its destructor merely stops its thread).
+**(a) The connection belongs to the process, not to any application object.** It is held by a global singleton
+(`Q_GLOBAL_STATIC(QDBusConnectionManager, _q_manager)`), stored in `connectionHash`, and cached by the raw pointer
+`defaultBuses[type]`, kept alive by `QDBusConnectionPrivate::ref` (initial value 1). Destruction of the probe
+application’s `QGuiApplication` only executes `QGuiApplicationPrivate::cleanup()`
+(`delete platform_theme; delete platform_integration;`, `qguiapplication.cpp:1886-1891`), i.e. it only destroys the
+connection’s **user**; QtDBus has no logic to “clean up when the application is destroyed,” and the global manager is
+destroyed only when the process exits (and its destructor merely stops its own thread).
 
-**(b) The "delivery will be re-enabled later" step was bound to the `qApp` that existed at creation time.**
+**(b) The “resume delivery later” step is bound to the qApp that existed when the connection was established.**
 
 ```cpp
 // src/dbus/qdbusconnectionmanager.cpp
-bool suspendedDelivery = QThread::isMainThread() && qApp;     // true → qApp == the probe app
+bool suspendedDelivery = QThread::isMainThread() && qApp;     // true → qApp is that temporary probe application
 ...
 if (suspendedDelivery && result && result->connection)
-    result->enableDispatchDelayed(qApp);                      // queued invocation on the probe app
+    result->enableDispatchDelayed(qApp);                      // queue the call for the probe application
 ```
 
 ```cpp
@@ -516,129 +516,67 @@ void QDBusConnectionPrivate::enableDispatchDelayed(QObject *context)
 }
 ```
 
-The probe application is destroyed before any event loop runs, so this queued invocation is dropped together
-with its receiver and `setDispatchEnabled(true)` is never executed.
+The probe application is destroyed before any event loop runs → this queued call disappears with its receiver →
+`setDispatchEnabled(true)` is never executed.
 
-**(c) The cached connection is never re-associated with the new qApp.** Every later
-`QDBusConnection::sessionBus()` — including the real `KisApplication`'s — takes this early return:
+**(c) The cached connection is not re-associated with the new qApp.** Every later `QDBusConnection::sessionBus()`
+(including the real `KisApplication`’s call) hits this early return:
 
 ```cpp
 if (defaultBuses[type])
-    return defaultBuses[type];          // cached pointer; the new qApp never re-arms the delayed enable
+    return defaultBuses[type];      // directly returns the cached pointer; the new qApp will not schedule “delayed resume” again
 ```
 
-`defaultBuses[]` is only initialised (to `nullptr`) in the manager's constructor and is never reset;
-`QDBusConnection::disconnectFromBus("qt_default_session_bus")` cannot clear it either
-(`removeConnection()` only removes the `connectionHash` entry). The connection therefore keeps
-`dispatchEnabled == false` for the rest of the process, and its association with the destroyed `qApp` is
-permanently stale.
+`defaultBuses[]` is initialized to `nullptr` only in the manager constructor and is never reset afterwards;
+`QDBusConnection::disconnectFromBus("qt_default_session_bus")` cannot clear it either (`removeConnection()` only deletes
+the entry in `connectionHash`). Therefore, for the remainder of the process’s entire lifetime, this connection remains
+`dispatchEnabled == false`, and its association with the destroyed qApp **remains invalid forever**.
 
-**(d) The observable result:**
+**(d) Observable result:**
 
 ```cpp
 // src/dbus/qdbusintegrator.cpp — QDBusConnectionPrivate::handleMessage()
 if (!dispatchEnabled && !isLocal) {
     qDBusDebug() << this << "delivery is suspended";
     pendingMessages << amsg;
-    return amsg.type() == QDBusMessage::MethodCallMessage;   // reported as handled, no reply is ever sent
+    return amsg.type() == QDBusMessage::MethodCallMessage;   // recorded as “handled”, but never replies
 }
 ```
 
-Every incoming method call is queued and never answered (not even an error). Only the connection-level
-`org.freedesktop.DBus.Peer.Ping` is answered (it does not go through this gate), which makes the failure easy
-to misdiagnose.
+All inbound method calls are queued and never answered (not even an error is returned). Only the connection-level
+`org.freedesktop.DBus.Peer.Ping` still responds (it does not pass through this gate), which is why it is easy to
+misdiagnose.
 
-**(e) Why the symptoms are "empty applet **and** no in-window menu bar":** outgoing and blocking calls work
-normally, so `RegisterWindow` succeeds and Plasma even stores `(:service, /MenuBar/N)` for Krita's window; but
-the applet's `GetLayout` / `AboutToShow` on that object never get a reply and time out. Since Qt believes a
-native global menu bar exists, it also hides the in-window menu bar. `KDE_NO_GLOBAL_MENU=1` makes
-`createPlatformMenuBar()` return `nullptr`, so Qt draws the menu bar inside the window instead.
+**(e) Why it manifests as “panel empty **and** no menu bar inside the window”:** Outgoing and blocking calls work
+normally, so `RegisterWindow` succeeds and Plasma remembers `(:service, /MenuBar/N)`; but the applet’s `GetLayout` /
+`AboutToShow` on that object never receives a reply and times out. At the same time, Qt believes a native global menu
+bar exists, so it hides the in-window menu bar. `KDE_NO_GLOBAL_MENU=1` makes `createPlatformMenuBar()` return `nullptr`,
+and Qt draws the menu bar back inside the window.
 
-## 4. Evidence
+## III. Why This Was Reported to KDE Rather Than Qt
 
-* **Cross-process probes** against Krita's exported menu object: `Introspect`, `GetLayout`, `AboutToShow` all
-  time out; `org.freedesktop.DBus.Peer.Ping` answers. With `QDBUS_DEBUG=1` Krita itself prints
-  `delivery is suspended` for each of those calls.
-* **The menu is registered correctly** — `xprop` shows `_KDE_NET_WM_APPMENU_SERVICE_NAME` / `_OBJECT_PATH`, and
-  the registrar returns `(':1.x', '/MenuBar/N')` — so this is neither a registration nor a KWin problem.
-* **gdb backtrace** of the first `QDBusConnection::sessionBus()` call inside the probe application (§3.3).
-* **Bisection with a minimal reproducer** (a windowed Qt 5/Qt 6 program that optionally creates a throw-away
-  `QGuiApplication` / `QWindow` before the real `QApplication`):
+> **Translator’s note:** In the Chinese original, this section is preceded by “此部分由 DeepSeek V4.1 Flash 生成。”,
+> meaning this section of the Chinese original was generated by AI. Rendered literally: “This section was generated by
+> DeepSeek V4.1 Flash.”
 
-  | configuration | `isNativeMenuBar()` | `/MenuBar/1` registered | cross-process `Introspect`/`AboutToShow` |
-  |---|---|---|---|
-  | plain application | true | true | 0 / 0 |
-  | throw-away `QCoreApplication` only | true | true | 0 / 0 |
-  | throw-away `QGuiApplication` without a `QWindow` | true | true | 0 / 0 |
-  | **throw-away `QGuiApplication` + `QWindow` (Krita's prober)** | true | true | **124 / 124 (timeout)** |
-  | same, but `AT_SPI_BUS_ADDRESS` non-empty during the probe | true | true | **0 / 0** |
-  | same, but `DBUS_SESSION_BUS_ADDRESS` poisoned during the probe | false | false | object never registered |
+* During the process of constructing that application object before Krita really runs, existing code already excludes
+  most functionality that could produce a D-Bus connection. From this, one may guess that Krita had probably already
+  considered the behavior of Qt’s D-Bus connection manager.
+* Based on this, this report was first submitted to KDE: it records the symptoms observable on the Krita side,
+  reproduction steps, and a mitigation that can be implemented on the Krita side (see 1.2); fixing the Krita side is
+  also sufficient to eliminate the symptom.
+* However, from the mechanism perspective, this looks more like a Qt defect:
+    * First, the connection manager caches connections in `defaultBuses[]`, but its binding with `qApp`
+      (`enableDispatchDelayed(qApp)`) is not updated when the application object is replaced, nor is it rescheduled when
+      the cached connection is handed out.
+    * Second, `QAccessible::isActive()` instantiates the at-spi bridge and establishes a D-Bus connection because the
+      QPA integration implements `accessibility()` lazily; this does not match how the function is recommended to be
+      used (as a cheap guard).
+* I have not confirmed whether there is already a related Qt report. If a developer familiar with Qt can confirm that
+  this is indeed a Qt bug, I hope you can help report it to Qt. A more detailed technical description for the Qt side is
+  in the accompanying `QTBUG-REPORT.md`.
 
-  (`124` = the call timed out without a reply.) Qt 5 is healthy in every one of these configurations *except*
-  when the probe really does open the session bus (the path Krita's Qt 5 build blocks with
-  `QT_NO_XDG_DESKTOP_PORTAL=1`).
-
-## 5. Why this is reported to KDE rather than to Qt
-
-* Please note: **the code that constructs that application object before Krita really runs already excludes most
-  of the functionality that could create a D-Bus connection** (see §3.1: the portal watcher and the KDE platform
-  theme are both explicitly disabled, and commit `8d6a2a5d12` / BUG 408015 dealt with the same class of problem).
-  We therefore **suspect that Krita has already taken Qt's D-Bus connection-manager behaviour into account**.
-* For that reason this report goes to KDE first: it documents the symptom as observed in Krita, the reproduction
-  steps, and a mitigation that can be implemented on the Krita side (§6). Fixing the Krita side is enough to
-  remove the symptom.
-* Mechanically, however, this looks like a **Qt defect**: the "resume delivery" step is bound to a `qApp` that is
-  later destroyed (`enableDispatchDelayed(qApp)`), and the cached connection (`defaultBuses[]`) is handed to the
-  new `qApp` without any re-binding or re-arming.
-* **I (the reporter) have not checked whether Qt already has a report for this** (Qt's tracker needs an account;
-  I did not search or file there). If a developer familiar with Qt can confirm that this is indeed a Qt bug,
-  **please help forward it to Qt** (bugreports.qt.io, project QTBUG, component DBus / related: GUI:
-  Accessibility). I can provide the minimal reproducer (a ~30-line single-file version, or the windowed Qt 5/Qt 6
-  reproducer) and the full backtrace evidence — just ask below.
-
-## 6. Mitigation: set `AT_SPI_BUS_ADDRESS` to a non-empty value
-
-**Set `AT_SPI_BUS_ADDRESS` to any non-empty value while the throw-away probe application is alive** (Krita's
-existing `EnvironmentSetter` RAII pattern is a natural fit), and drop the probe's accessibility connection before
-the real application is created:
-
-```cpp
-// in KisOpenGLModeProber::probeFormat(), next to the existing portal guard
-a11ySetter.reset(new EnvironmentSetter(QLatin1String("AT_SPI_BUS_ADDRESS"),
-                                       QLatin1String("unix:path=/nonexistent-krita-probe")));
-...
-// after the probe application(s) are gone, before KisApplication is constructed
-QDBusConnection::disconnectFromBus(QStringLiteral("a11y"));
-```
-
-Why it works: the at-spi bridge takes the early-return path shown in §3.3, so `QDBusConnection::sessionBus()` is
-not called from the probe at all; the process' first session-bus connection is then created by the real
-application, whose event loop does run, so the delayed delivery enable executes normally and the applet displays
-Krita's menu. Measured: with this guard the exported object answers immediately, and `KDE_NO_GLOBAL_MENU` is no
-longer needed.
-
-Caveats:
-
-* Keep it scoped to the probe application. Setting it for the whole process also hides the symptom but silently
-  disables accessibility for the entire Krita process.
-* `disconnectFromBus("a11y")` is required, because the probe's bridge has already created a named connection
-  under that address.
-* This guard **cannot** be replaced by the KDE platform theme guard or the portal guard; both must stay
-  (measured: combining it with `--no-portal-guard` still reproduces the bug).
-
-## 7. Suggested fixes
-
-* **Krita (root fix):** do not create a second `QGuiApplication` in the process. Either probe inside the real
-  application (using a `QOffscreenSurface` / hidden `QWindow` before any visible window exists, reworking the
-  `Qt::AA_*` attributes that `probeFormat(adjustGlobalState = true)` currently sets before application
-  construction), or move the probing into a **child process** (`krita --probe-opengl …`). Until then, keep the
-  existing guards and add the `AT_SPI_BUS_ADDRESS` guard from §6 as a stopgap.
-* **Qt (upstream):** make the delayed delivery enable independent of the application object that happened to
-  exist when the connection was created, and/or re-arm it when `QDBusConnectionManager::busConnection()` hands
-  out a cached connection that is still suspended. Additionally, do not cache a *failed* connection
-  unconditionally in `defaultBuses[]`.
-
-## 8. Related reports
+## IV. Related Reports
 
 * KDE bug 483170 — appmenu (global menu) doesn't work with krita on plasma 6
 * KDE bug 515889 — [qt6] Application Menu is unavailable on Krita 6
