@@ -1,5 +1,7 @@
 # appmenu_test — Krita 6 / Qt 6 全局菜单空白的最小可视复现
 
+> 英文译本：[`README.en.md`](README.en.md)（仅供阅读；**本文中文版为准**）。
+
 一个窗口化的最小复现程序：在**真正的 `QApplication` 之前**创建一个一次性
 `QGuiApplication`（这正是 Krita 的 OpenGL 探测器
 `KisOpenGLModeProber::probeFormat()` 所做的事），然后打开一个普通窗口。
@@ -177,3 +179,7 @@ QAtSpiDBusConnection::QAtSpiDBusConnection(QObject *parent) : ... {
 
 完整原因分析（QtDBus 内部机制、实测矩阵、KDE 侧缓解措施与建议修法）：
 [`BUGREPORT.md`](BUGREPORT.md)（中文，以此为准）· [`BUGREPORT.en.md`](BUGREPORT.en.md)（English）。
+
+---
+
+> 英文译本：[`README.en.md`](README.en.md)
